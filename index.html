@@ -11,26 +11,54 @@
     <script>
         let mediaRecorder;
         let stream;
+        let socket; // NEW: holds our WebSocket connection
 
         const startBtn = document.getElementById("startBtn");
         const stopBtn = document.getElementById("stopBtn");
 
         startBtn.addEventListener("click", async () => {
             try {
+                // NEW: open the WebSocket connection first, before touching the mic.
+                socket = new WebSocket("ws://127.0.0.1:8000/ws/echo");
+
+                socket.onopen = () => {
+                    console.log("WebSocket connection opened.");
+                };
+
+                socket.onmessage = (event) => {
+                    // This fires whenever the server sends something back.
+                    // Right now the server echoes bytes, so this logs the echo.
+                    console.log("Message from server:", event.data);
+                };
+
+                socket.onerror = (err) => {
+                    console.error("WebSocket error:", err);
+                };
+
+                socket.onclose = () => {
+                    console.log("WebSocket connection closed.");
+                };
+
                 // Ask the browser for mic access. This triggers the permission popup.
                 stream = await navigator.mediaDevices.getUserMedia({ audio: true });
                 console.log("Mic access granted. Stream:", stream);
 
-                // Wrap the stream in a MediaRecorder so we can get chunked data out of it.
                 mediaRecorder = new MediaRecorder(stream);
 
-                // This fires every time a chunk of audio is ready, based on the
-                // timeslice we pass to .start() below.
                 mediaRecorder.ondataavailable = (event) => {
                     console.log("Chunk received, size in bytes:", event.data.size);
+
+                    // NEW: send the chunk over the WebSocket, but only if it's open.
+                    // socket.readyState === WebSocket.OPEN guards against trying to
+                    // send before the connection is ready, or after it's closed.
+                    if (socket.readyState === WebSocket.OPEN) {
+                        socket.send(event.data); // Blob sent directly, no conversion needed
+                        console.log("Chunk sent to server.");
+                    } else {
+                        console.warn("Socket not open, skipping send.");
+                    }
                 };
 
-                // Start recording, producing a new chunk roughly every 250ms.
                 mediaRecorder.start(250);
                 console.log("Recording started.");
 
@@ -44,8 +72,10 @@
 
         stopBtn.addEventListener("click", () => {
             mediaRecorder.stop();
-            stream.getTracks().forEach(track => track.stop()); // releases the mic
+            stream.getTracks().forEach(track => track.stop());
             console.log("Recording stopped.");
+
+            socket.close(); // NEW: cleanly close the WebSocket too
 
             startBtn.disabled = false;
             stopBtn.disabled = true;
