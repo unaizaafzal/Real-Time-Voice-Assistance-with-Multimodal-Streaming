@@ -19,7 +19,7 @@
         startBtn.addEventListener("click", async () => {
             try {
                 // NEW: open the WebSocket connection first, before touching the mic.
-                socket = new WebSocket("ws://127.0.0.1:8000/ws/echo");
+                socket = new WebSocket("ws://127.0.0.1:8000/ws/audio");
 
                 socket.onopen = () => {
                     console.log("WebSocket connection opened.");
