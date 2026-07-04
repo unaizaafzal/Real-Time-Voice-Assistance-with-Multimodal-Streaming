@@ -9,18 +9,19 @@ from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.frames.frames import (
     InputAudioRawFrame,
+    OutputAudioRawFrame,
     TranscriptionFrame,
     InterimTranscriptionFrame,
     LLMContextFrame,
     LLMTextFrame,
     LLMFullResponseStartFrame,
     LLMFullResponseEndFrame,
-    TextFrame,
     Frame
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
 from pipecat.services.groq.llm import GroqLLMService
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
@@ -46,6 +47,8 @@ class RawAudioSerializer(FrameSerializer):
         return None
 
     async def serialize(self, frame: Frame):
+        if isinstance(frame, OutputAudioRawFrame):
+            return frame.audio
         return None
 
 
@@ -64,29 +67,46 @@ class TranscriptionLogger(FrameProcessor):
 class TranscriptionToLLM(FrameProcessor):
     def __init__(self):
         super().__init__()
-        # Maintain conversation history across turns
         self._messages = [
-            {
-                "role": "system",
-                "content": "You are a helpful voice assistant. Keep responses concise and conversational — two or three sentences maximum, since your response will be spoken aloud."
-            }
-        ]
+    {
+        "role": "system",
+        "content": "You are a concise voice assistant. Answer questions directly in one or two sentences. Never ask clarifying questions. Never repeat the question back. Just answer immediately and stop."
+    }
+]
+        self._current_assistant_response = ""
 
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-            print(f"[{time.time():.3f}] Sending to LLM: '{frame.text}'")
+            word_count = len(frame.text.strip().split())
+            if word_count < 3:
+                print(f"[{time.time():.3f}] Ignoring short fragment: '{frame.text}'")
+                await self.push_frame(frame, direction)
+                return
 
-            # Add user turn to history
+            print(f"[{time.time():.3f}] Sending to LLM: '{frame.text}'")
             self._messages.append({
                 "role": "user",
                 "content": frame.text
             })
-
-            # Build context and push to Groq
+            self._current_assistant_response = ""
             context = LLMContext(messages=self._messages)
             await self.push_frame(LLMContextFrame(context=context))
+
+        elif isinstance(frame, LLMTextFrame):
+            self._current_assistant_response += frame.text
+            await self.push_frame(frame, direction)
+
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            if self._current_assistant_response.strip():
+                self._messages.append({
+                    "role": "assistant",
+                    "content": self._current_assistant_response
+                })
+                print(f"[{time.time():.3f}] Assistant response saved to history.")
+            await self.push_frame(frame, direction)
+
         else:
             await self.push_frame(frame, direction)
 
@@ -125,15 +145,24 @@ async def websocket_endpoint(websocket: WebSocket):
             sample_rate=16000,
             settings=DeepgramSTTSettings(
                 interim_results=True,
-                utterance_end_ms=1000,
+                utterance_end_ms=1500,
+                endpointing=600,
+                smart_format=True,
             )
         )
 
         groq = GroqLLMService(
-    api_key=os.getenv("GROQ_API_KEY"),
-    settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
-    )
+            api_key=os.getenv("GROQ_API_KEY"),
+            settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
+        )
 
+        elevenlabs = ElevenLabsTTSService(
+            api_key=os.getenv("ELEVENLABS_API_KEY"),
+            settings=ElevenLabsTTSService.Settings(
+                voice=os.getenv("ELEVENLABS_VOICE_ID"),
+            ),
+            sample_rate=16000,
+        )
 
         pipeline = Pipeline([
             transport.input(),
@@ -142,6 +171,7 @@ async def websocket_endpoint(websocket: WebSocket):
             TranscriptionToLLM(),
             groq,
             LLMResponseLogger(),
+            elevenlabs,
             transport.output(),
         ])
 
