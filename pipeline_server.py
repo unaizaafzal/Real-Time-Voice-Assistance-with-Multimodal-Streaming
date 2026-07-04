@@ -11,9 +11,16 @@ from pipecat.frames.frames import (
     InputAudioRawFrame,
     TranscriptionFrame,
     InterimTranscriptionFrame,
+    LLMContextFrame,
+    LLMTextFrame,
+    LLMFullResponseStartFrame,
+    LLMFullResponseEndFrame,
+    TextFrame,
     Frame
 )
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.deepgram.stt import DeepgramSTTService, DeepgramSTTSettings
+from pipecat.services.groq.llm import GroqLLMService
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketTransport,
@@ -48,9 +55,52 @@ class TranscriptionLogger(FrameProcessor):
 
         if isinstance(frame, TranscriptionFrame):
             print(f"[{time.time():.3f}] FINAL transcript: '{frame.text}'")
-
         elif isinstance(frame, InterimTranscriptionFrame):
             print(f"[{time.time():.3f}] interim: '{frame.text}'")
+
+        await self.push_frame(frame, direction)
+
+
+class TranscriptionToLLM(FrameProcessor):
+    def __init__(self):
+        super().__init__()
+        # Maintain conversation history across turns
+        self._messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful voice assistant. Keep responses concise and conversational — two or three sentences maximum, since your response will be spoken aloud."
+            }
+        ]
+
+    async def process_frame(self, frame: Frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame) and frame.text.strip():
+            print(f"[{time.time():.3f}] Sending to LLM: '{frame.text}'")
+
+            # Add user turn to history
+            self._messages.append({
+                "role": "user",
+                "content": frame.text
+            })
+
+            # Build context and push to Groq
+            context = LLMContext(messages=self._messages)
+            await self.push_frame(LLMContextFrame(context=context))
+        else:
+            await self.push_frame(frame, direction)
+
+
+class LLMResponseLogger(FrameProcessor):
+    async def process_frame(self, frame: Frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMTextFrame):
+            print(f"[{time.time():.3f}] LLM token: '{frame.text}'")
+        elif isinstance(frame, LLMFullResponseStartFrame):
+            print(f"[{time.time():.3f}] LLM response starting...")
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            print(f"[{time.time():.3f}] LLM response complete.")
 
         await self.push_frame(frame, direction)
 
@@ -79,10 +129,19 @@ async def websocket_endpoint(websocket: WebSocket):
             )
         )
 
+        groq = GroqLLMService(
+    api_key=os.getenv("GROQ_API_KEY"),
+    settings=GroqLLMService.Settings(model="llama-3.3-70b-versatile"),
+    )
+
+
         pipeline = Pipeline([
             transport.input(),
             deepgram,
             TranscriptionLogger(),
+            TranscriptionToLLM(),
+            groq,
+            LLMResponseLogger(),
             transport.output(),
         ])
 
