@@ -10,97 +10,109 @@
     <div id="transcript" style="margin-top: 20px; font-size: 18px;"></div>
 
     <script>
-        let recordingContext;  // 16kHz context for mic input
-let playbackContext;   // native sample rate context for TTS output
-let workletNode;
-let stream;
-let socket;
-let nextStartTime = 0; // for scheduling TTS chunks back-to-back precisely
+        let recordingContext;
+        let playbackContext;
+        let workletNode;
+        let stream;
+        let socket;
+        let nextStartTime = 0;
+        let audioBuffer = [];
 
-const startBtn = document.getElementById("startBtn");
-const stopBtn = document.getElementById("stopBtn");
+        const startBtn = document.getElementById("startBtn");
+        const stopBtn = document.getElementById("stopBtn");
 
-startBtn.addEventListener("click", async () => {
-    try {
-        socket = new WebSocket("ws://127.0.0.1:8000/ws/audio");
-        socket.binaryType = "arraybuffer";
+        startBtn.addEventListener("click", async () => {
+            try {
+                audioBuffer = [];
+                socket = new WebSocket("ws://127.0.0.1:8000/ws/audio");
+                socket.binaryType = "arraybuffer";
 
-        socket.onopen = () => console.log("WebSocket opened.");
+                socket.onopen = () => {
+                    console.log("WebSocket opened.");
+                    // Flush any chunks that arrived during connection
+                    while (audioBuffer.length > 0) {
+                        socket.send(audioBuffer.shift());
+                    }
+                };
 
-        socket.onmessage = async (event) => {
-            if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) return;
+                socket.onmessage = async (event) => {
+                    if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) return;
 
-            // Use native sample rate context for clean playback
-            if (!playbackContext || playbackContext.state === "closed") {
-                playbackContext = new AudioContext();
+                    if (!playbackContext || playbackContext.state === "closed") {
+                        playbackContext = new AudioContext();
+                    }
+
+                    const int16 = new Int16Array(event.data);
+                    const float32 = new Float32Array(int16.length);
+                    for (let i = 0; i < int16.length; i++) {
+                        float32[i] = int16[i] / 32768.0;
+                    }
+
+                    const buffer = playbackContext.createBuffer(1, float32.length, 16000);
+                    buffer.getChannelData(0).set(float32);
+
+                    const source = playbackContext.createBufferSource();
+                    source.buffer = buffer;
+                    source.connect(playbackContext.destination);
+
+                    const currentTime = playbackContext.currentTime;
+                    const startTime = Math.max(currentTime + 0.05, nextStartTime);
+                    source.start(startTime);
+                    nextStartTime = startTime + buffer.duration;
+
+                    console.log("Scheduled TTS chunk:", event.data.byteLength, "bytes");
+                };
+
+                socket.onerror = (err) => console.error("WebSocket error:", err);
+                socket.onclose = () => {
+                    console.log("WebSocket closed.");
+                    nextStartTime = 0;
+                };
+
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                recordingContext = new AudioContext({ sampleRate: 16000 });
+
+                await recordingContext.audioWorklet.addModule("audio_processor.js");
+
+                const source = recordingContext.createMediaStreamSource(stream);
+                workletNode = new AudioWorkletNode(recordingContext, "audio-processor");
+
+                workletNode.port.onmessage = (event) => {
+                    if (socket.readyState === WebSocket.OPEN) {
+                        // Flush any buffered chunks first
+                        while (audioBuffer.length > 0) {
+                            socket.send(audioBuffer.shift());
+                        }
+                        socket.send(event.data);
+                    } else if (socket.readyState === WebSocket.CONNECTING) {
+                        // Buffer chunks that arrive before connection is ready
+                        audioBuffer.push(event.data);
+                    }
+                };
+
+                source.connect(workletNode);
+                workletNode.connect(recordingContext.destination);
+
+                console.log("Recording started.");
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+
+            } catch (err) {
+                console.error("Error:", err);
             }
+        });
 
-            const int16 = new Int16Array(event.data);
-            const float32 = new Float32Array(int16.length);
-            for (let i = 0; i < int16.length; i++) {
-                float32[i] = int16[i] / 32768.0;
-            }
-
-            // Create buffer at 16kHz (ElevenLabs output rate we requested)
-            const buffer = playbackContext.createBuffer(1, float32.length, 16000);
-            buffer.getChannelData(0).set(float32);
-
-            const source = playbackContext.createBufferSource();
-            source.buffer = buffer;
-            source.connect(playbackContext.destination);
-
-            // Schedule chunks precisely back-to-back — no gaps, no overlaps
-            const currentTime = playbackContext.currentTime;
-            const startTime = Math.max(currentTime + 0.05, nextStartTime);
-            source.start(startTime);
-            nextStartTime = startTime + buffer.duration;
-
-            console.log("Scheduled TTS chunk:", event.data.byteLength, "bytes");
-        };
-
-        socket.onerror = (err) => console.error("WebSocket error:", err);
-        socket.onclose = () => {
-            console.log("WebSocket closed.");
+        stopBtn.addEventListener("click", async () => {
+            workletNode.disconnect();
+            stream.getTracks().forEach(track => track.stop());
+            await recordingContext.close();
+            socket.close();
             nextStartTime = 0;
-        };
-
-        // 16kHz context for mic capture only
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        recordingContext = new AudioContext({ sampleRate: 16000 });
-
-        await recordingContext.audioWorklet.addModule("audio_processor.js");
-
-        const source = recordingContext.createMediaStreamSource(stream);
-        workletNode = new AudioWorkletNode(recordingContext, "audio-processor");
-
-        workletNode.port.onmessage = (event) => {
-            if (socket.readyState === WebSocket.OPEN) {
-                socket.send(event.data);
-            }
-        };
-
-        source.connect(workletNode);
-        workletNode.connect(recordingContext.destination);
-
-        console.log("Recording started.");
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-
-    } catch (err) {
-        console.error("Error:", err);
-    }
-});
-
-stopBtn.addEventListener("click", async () => {
-    workletNode.disconnect();
-    stream.getTracks().forEach(track => track.stop());
-    await recordingContext.close();
-    socket.close();
-    nextStartTime = 0;
-    console.log("Recording stopped.");
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
-});
+            audioBuffer = [];
+            console.log("Recording stopped.");
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+        });
     </script>
 </body>
 </html>

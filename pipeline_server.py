@@ -79,12 +79,6 @@ class TranscriptionToLLM(FrameProcessor):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-            word_count = len(frame.text.strip().split())
-            if word_count < 3:
-                print(f"[{time.time():.3f}] Ignoring short fragment: '{frame.text}'")
-                await self.push_frame(frame, direction)
-                return
-
             print(f"[{time.time():.3f}] Sending to LLM: '{frame.text}'")
             self._messages.append({
                 "role": "user",
