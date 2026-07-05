@@ -36,6 +36,16 @@
                 };
 
                 socket.onmessage = async (event) => {
+                    if (typeof event.data === "string") {
+        try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === "error") {
+                document.getElementById("transcript").textContent = msg.message;
+                console.warn("Server error:", msg.message);
+            }
+        } catch (e) {}
+        return;
+    }
                     if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) return;
 
                     if (!playbackContext || playbackContext.state === "closed") {

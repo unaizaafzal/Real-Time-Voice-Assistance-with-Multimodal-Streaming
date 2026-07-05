@@ -1,6 +1,7 @@
 import asyncio
 import os
 import time
+import json
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
 from pipecat.pipeline.pipeline import Pipeline
@@ -16,7 +17,6 @@ from pipecat.frames.frames import (
     LLMTextFrame,
     LLMFullResponseStartFrame,
     LLMFullResponseEndFrame,
-    TextFrame,
     Frame
 )
 from pipecat.processors.aggregators.llm_context import LLMContext
@@ -33,51 +33,59 @@ load_dotenv()
 
 app = FastAPI()
 
-# ─── Latency Budget Tracker ───────────────────────────────────────────────────
-# Tracks timestamps at each hop so we can print a clean breakdown per turn.
+# ─── Latency budget tracker ───────────────────────────────────────────────────
+# Stores timestamps for each hop in the pipeline per turn.
+# Printed after each complete turn so you can see exactly where time is spent.
+
 class LatencyTracker:
     def __init__(self):
         self.reset()
 
     def reset(self):
         self.speech_end_time = None        # when Deepgram fired final transcript
-        self.llm_first_token_time = None   # when first LLM token arrived
-        self.tts_first_audio_time = None   # when first TTS audio chunk arrived
+        self.first_llm_token_time = None   # when Groq returned first token
+        self.first_tts_audio_time = None   # when ElevenLabs returned first audio byte
 
-    def record_speech_end(self):
+    def mark_speech_end(self):
         self.speech_end_time = time.time()
 
-    def record_llm_first_token(self):
-        if self.llm_first_token_time is None:
-            self.llm_first_token_time = time.time()
+    def mark_first_llm_token(self):
+        if self.first_llm_token_time is None:
+            self.first_llm_token_time = time.time()
 
-    def record_tts_first_audio(self):
-        if self.tts_first_audio_time is None:
-            self.tts_first_audio_time = time.time()
+    def mark_first_tts_audio(self):
+        if self.first_tts_audio_time is None:
+            self.first_tts_audio_time = time.time()
 
     def print_budget(self):
         if not self.speech_end_time:
             return
-        print("\n─── Latency Budget ───")
-        if self.llm_first_token_time:
-            asr_hop = self.llm_first_token_time - self.speech_end_time
-            print(f"  ASR → LLM first token:     {asr_hop*1000:.0f}ms")
-        if self.tts_first_audio_time and self.llm_first_token_time:
-            tts_hop = self.tts_first_audio_time - self.llm_first_token_time
-            print(f"  LLM first token → TTS audio: {tts_hop*1000:.0f}ms")
-        if self.tts_first_audio_time:
-            total = self.tts_first_audio_time - self.speech_end_time
-            print(f"  Total time to first audio:   {total*1000:.0f}ms")
-        print("──────────────────────\n")
+
+        print("\n━━━━━━━━━━ LATENCY BUDGET ━━━━━━━━━━")
+
+        if self.first_llm_token_time:
+            asr_to_llm = (self.first_llm_token_time - self.speech_end_time) * 1000
+            print(f"  ASR → first LLM token  : {asr_to_llm:.0f} ms")
+        else:
+            print("  ASR → first LLM token  : (no LLM token received)")
+
+        if self.first_llm_token_time and self.first_tts_audio_time:
+            llm_to_tts = (self.first_tts_audio_time - self.first_llm_token_time) * 1000
+            print(f"  LLM → first TTS audio  : {llm_to_tts:.0f} ms")
+        else:
+            print("  LLM → first TTS audio  : (no TTS audio received)")
+
+        if self.first_tts_audio_time:
+            total = (self.first_tts_audio_time - self.speech_end_time) * 1000
+            print(f"  Total time to first audio: {total:.0f} ms")
+
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
         self.reset()
 
 
 # ─── Serializer ───────────────────────────────────────────────────────────────
-class RawAudioSerializer(FrameSerializer):
-    def __init__(self, latency_tracker: LatencyTracker):
-        self._tracker = latency_tracker
-        self._first_audio_sent = False
 
+class RawAudioSerializer(FrameSerializer):
     async def setup(self, frame):
         pass
 
@@ -92,19 +100,12 @@ class RawAudioSerializer(FrameSerializer):
 
     async def serialize(self, frame: Frame):
         if isinstance(frame, OutputAudioRawFrame):
-            # Record when first TTS audio chunk goes out
-            if not self._first_audio_sent:
-                self._tracker.record_tts_first_audio()
-                self._tracker.print_budget()
-                self._first_audio_sent = True
             return frame.audio
         return None
 
-    def reset_audio_flag(self):
-        self._first_audio_sent = False
 
+# ─── Processors ───────────────────────────────────────────────────────────────
 
-# ─── Transcription Logger ─────────────────────────────────────────────────────
 class TranscriptionLogger(FrameProcessor):
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
@@ -117,14 +118,11 @@ class TranscriptionLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-# ─── Transcription → LLM with timeout handling ───────────────────────────────
 class TranscriptionToLLM(FrameProcessor):
-    LLM_TIMEOUT_SECONDS = 8  # if Groq doesn't respond in 8s, send fallback
-
-    def __init__(self, latency_tracker: LatencyTracker, serializer: RawAudioSerializer):
+    def __init__(self, latency: LatencyTracker, websocket: WebSocket):
         super().__init__()
-        self._tracker = latency_tracker
-        self._serializer = serializer
+        self._latency = latency
+        self._websocket = websocket
         self._messages = [
             {
                 "role": "system",
@@ -132,40 +130,47 @@ class TranscriptionToLLM(FrameProcessor):
             }
         ]
         self._current_assistant_response = ""
-        self._llm_task = None
+
+    async def _send_error_to_browser(self, message: str):
+        """Send a text notification to the browser when something goes wrong."""
+        try:
+            await self._websocket.send_text(
+                json.dumps({"type": "error", "message": message})
+            )
+        except Exception:
+            pass
 
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, TranscriptionFrame) and frame.text.strip():
-            # Record when speech ended — start of latency measurement
-            self._tracker.record_speech_end()
-            self._serializer.reset_audio_flag()
-
+            self._latency.mark_speech_end()
             print(f"[{time.time():.3f}] Sending to LLM: '{frame.text}'")
+
             self._messages.append({
                 "role": "user",
                 "content": frame.text
             })
             self._current_assistant_response = ""
-            context = LLMContext(messages=self._messages)
 
-            # Wrap the LLM push in a timeout — if Groq stalls, user hears
-            # a fallback message instead of dead air
             try:
+                # Graceful degradation: 8 second timeout on LLM context push.
+                # If Groq stalls, the user hears a fallback instead of silence.
+                context = LLMContext(messages=self._messages)
                 await asyncio.wait_for(
                     self.push_frame(LLMContextFrame(context=context)),
-                    timeout=self.LLM_TIMEOUT_SECONDS
+                    timeout=8.0
                 )
             except asyncio.TimeoutError:
-                print(f"[{time.time():.3f}] LLM TIMEOUT after {self.LLM_TIMEOUT_SECONDS}s — pushing fallback")
-                # Push a TextFrame with fallback text so TTS speaks it
-                await self.push_frame(TextFrame(
-                    text="I'm having trouble responding right now. Could you repeat that?"
-                ))
+                print(f"[{time.time():.3f}] LLM TIMEOUT — sending fallback")
+                await self._send_error_to_browser(
+                    "I'm taking too long to think. Could you repeat that?"
+                )
+                # Remove the failed user message from history
+                self._messages.pop()
 
         elif isinstance(frame, LLMTextFrame):
-            self._tracker.record_llm_first_token()
+            self._latency.mark_first_llm_token()
             self._current_assistant_response += frame.text
             await self.push_frame(frame, direction)
 
@@ -182,7 +187,27 @@ class TranscriptionToLLM(FrameProcessor):
             await self.push_frame(frame, direction)
 
 
-# ─── LLM Response Logger ──────────────────────────────────────────────────────
+class TTSLatencyMarker(FrameProcessor):
+    """Sits between ElevenLabs and the output transport.
+    Marks the timestamp of the first audio byte for latency tracking."""
+
+    def __init__(self, latency: LatencyTracker):
+        super().__init__()
+        self._latency = latency
+
+    async def process_frame(self, frame: Frame, direction):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, OutputAudioRawFrame):
+            self._latency.mark_first_tts_audio()
+
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            # Full turn complete — print the latency budget
+            self._latency.print_budget()
+
+        await self.push_frame(frame, direction)
+
+
 class LLMResponseLogger(FrameProcessor):
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
@@ -197,20 +222,21 @@ class LLMResponseLogger(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-# ─── WebSocket Endpoint ───────────────────────────────────────────────────────
+# ─── WebSocket endpoint ───────────────────────────────────────────────────────
+
 @app.websocket("/ws/audio")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    try:
-        tracker = LatencyTracker()
-        serializer = RawAudioSerializer(latency_tracker=tracker)
 
+    latency = LatencyTracker()
+
+    try:
         transport = FastAPIWebsocketTransport(
             websocket=websocket,
             params=FastAPIWebsocketParams(
                 audio_in_enabled=True,
                 audio_out_enabled=True,
-                serializer=serializer,
+                serializer=RawAudioSerializer(),
                 allowed_origins=[]
             )
         )
@@ -240,19 +266,15 @@ async def websocket_endpoint(websocket: WebSocket):
             sample_rate=16000,
         )
 
-        # Graceful degradation: notify browser if Deepgram drops
-        @transport.event_handler("on_client_disconnected")
-        async def on_disconnect(t, ws):
-            print(f"[{time.time():.3f}] Client disconnected — cleaning up.")
-
         pipeline = Pipeline([
             transport.input(),
             deepgram,
             TranscriptionLogger(),
-            TranscriptionToLLM(latency_tracker=tracker, serializer=serializer),
+            TranscriptionToLLM(latency, websocket),
             groq,
             LLMResponseLogger(),
             elevenlabs,
+            TTSLatencyMarker(latency),
             transport.output(),
         ])
 
@@ -262,11 +284,6 @@ async def websocket_endpoint(websocket: WebSocket):
         await runner.run(task)
 
     except Exception as e:
-        print(f"[{time.time():.3f}] ERROR IN ENDPOINT: {type(e).__name__}: {e}")
-        # Graceful degradation: try to notify browser before dying
-        try:
-            await websocket.send_text(f'{{"type": "error", "message": "Server error: {type(e).__name__}"}}')
-        except Exception:
-            pass
+        print(f"ERROR IN ENDPOINT: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
