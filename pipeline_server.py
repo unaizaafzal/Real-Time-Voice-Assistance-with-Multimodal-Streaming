@@ -11,6 +11,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 from pipecat.frames.frames import (
     InputAudioRawFrame,
     OutputAudioRawFrame,
+    TTSAudioRawFrame,
     TranscriptionFrame,
     InterimTranscriptionFrame,
     LLMContextFrame,
@@ -170,7 +171,6 @@ class TranscriptionToLLM(FrameProcessor):
                 self._messages.pop()
 
         elif isinstance(frame, LLMTextFrame):
-            self._latency.mark_first_llm_token()
             self._current_assistant_response += frame.text
             await self.push_frame(frame, direction)
 
@@ -198,7 +198,7 @@ class TTSLatencyMarker(FrameProcessor):
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
 
-        if isinstance(frame, OutputAudioRawFrame):
+        if isinstance(frame, TTSAudioRawFrame,):
             self._latency.mark_first_tts_audio()
 
         elif isinstance(frame, LLMFullResponseEndFrame):
@@ -209,10 +209,14 @@ class TTSLatencyMarker(FrameProcessor):
 
 
 class LLMResponseLogger(FrameProcessor):
+    def __init__(self, latency: LatencyTracker):
+        super().__init__()
+        self._latency = latency
     async def process_frame(self, frame: Frame, direction):
         await super().process_frame(frame, direction)
 
         if isinstance(frame, LLMTextFrame):
+            self._latency.mark_first_llm_token()
             print(f"[{time.time():.3f}] LLM token: '{frame.text}'")
         elif isinstance(frame, LLMFullResponseStartFrame):
             print(f"[{time.time():.3f}] LLM response starting...")
@@ -272,7 +276,7 @@ async def websocket_endpoint(websocket: WebSocket):
             TranscriptionLogger(),
             TranscriptionToLLM(latency, websocket),
             groq,
-            LLMResponseLogger(),
+            LLMResponseLogger(latency),
             elevenlabs,
             TTSLatencyMarker(latency),
             transport.output(),

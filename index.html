@@ -24,33 +24,35 @@
         startBtn.addEventListener("click", async () => {
             try {
                 audioBuffer = [];
+
+                // Create playback context during user gesture, not later
+                playbackContext = new AudioContext();
+                await playbackContext.resume();
+
                 socket = new WebSocket("ws://127.0.0.1:8000/ws/audio");
                 socket.binaryType = "arraybuffer";
 
                 socket.onopen = () => {
                     console.log("WebSocket opened.");
-                    // Flush any chunks that arrived during connection
                     while (audioBuffer.length > 0) {
                         socket.send(audioBuffer.shift());
                     }
                 };
 
                 socket.onmessage = async (event) => {
+                    // Handle text error notifications from server
                     if (typeof event.data === "string") {
-        try {
-            const msg = JSON.parse(event.data);
-            if (msg.type === "error") {
-                document.getElementById("transcript").textContent = msg.message;
-                console.warn("Server error:", msg.message);
-            }
-        } catch (e) {}
-        return;
-    }
-                    if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) return;
-
-                    if (!playbackContext || playbackContext.state === "closed") {
-                        playbackContext = new AudioContext();
+                        try {
+                            const msg = JSON.parse(event.data);
+                            if (msg.type === "error") {
+                                document.getElementById("transcript").textContent = msg.message;
+                                console.warn("Server error:", msg.message);
+                            }
+                        } catch (e) {}
+                        return;
                     }
+
+                    if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) return;
 
                     const int16 = new Int16Array(event.data);
                     const float32 = new Float32Array(int16.length);
@@ -79,9 +81,16 @@
                     nextStartTime = 0;
                 };
 
-                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                recordingContext = new AudioContext({ sampleRate: 16000 });
+                // Enable echo cancellation so mic doesn't pick up TTS output
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    }
+                });
 
+                recordingContext = new AudioContext({ sampleRate: 16000 });
                 await recordingContext.audioWorklet.addModule("audio_processor.js");
 
                 const source = recordingContext.createMediaStreamSource(stream);
@@ -89,13 +98,11 @@
 
                 workletNode.port.onmessage = (event) => {
                     if (socket.readyState === WebSocket.OPEN) {
-                        // Flush any buffered chunks first
                         while (audioBuffer.length > 0) {
                             socket.send(audioBuffer.shift());
                         }
                         socket.send(event.data);
                     } else if (socket.readyState === WebSocket.CONNECTING) {
-                        // Buffer chunks that arrive before connection is ready
                         audioBuffer.push(event.data);
                     }
                 };
